@@ -312,7 +312,7 @@ function Install-FromInstaller {
         Write-Log "Установка $Name завершилась с кодом: $($Process.ExitCode)"
         return $false
     } catch {
-        Write-Log "Ошибка запуска установщика $Name: $($_.Exception.Message)"
+        Write-Log "Ошибка запуска установщика ${Name}: $($_.Exception.Message)"
         return $false
     }
 }
