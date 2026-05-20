@@ -5,11 +5,16 @@ set +e
 
 LOG_DIR="$HOME/Library/Logs/OnboardingInstall"
 LOG_FILE="$LOG_DIR/install-log.txt"
+WORK_DIR="/tmp/onboarding-install"
 
 MIN_MACOS_VERSION="26.2"
 INSTALL_DOCKER_DESKTOP=true
 
+OFFICE_URL="https://res.public.onecdn.static.microsoft/mro1cdnstorage/C1297A47-86C4-4C1F-97FA-950631F94777/MacAutoupdate/Microsoft_365_and_Office_16.109.26051717_Installer.pkg"
+OFFICE_PKG="$WORK_DIR/Microsoft_Office_Installer.pkg"
+
 mkdir -p "$LOG_DIR"
+mkdir -p "$WORK_DIR"
 
 write_log() {
     local message="$1"
@@ -173,7 +178,7 @@ prepare_homebrew() {
     write_log "Обновляю Homebrew."
     brew update >> "$LOG_FILE" 2>&1
 
-    write_log "Homebrew готов к установке программ."
+    write_log "Homebrew готов."
 }
 
 install_brew_cask() {
@@ -198,54 +203,50 @@ install_brew_cask() {
     if [ $? -eq 0 ]; then
         write_log "УСПЕШНО: $display_name"
         return 0
-    fi
-
-    write_log "Первая попытка не удалась: $display_name"
-    write_log "Пробую переустановить с очисткой."
-
-    brew uninstall --cask "$cask_name" --force >> "$LOG_FILE" 2>&1
-    brew cleanup "$cask_name" >> "$LOG_FILE" 2>&1
-    brew install --cask "$cask_name" --no-quarantine >> "$LOG_FILE" 2>&1
-
-    if [ $? -eq 0 ]; then
-        write_log "УСПЕШНО после повторной попытки: $display_name"
-        return 0
     else
         write_log "ОШИБКА установки: $display_name"
         return 1
     fi
 }
 
-install_microsoft_office() {
-    write_log "Начинаю установку Microsoft Office."
+install_microsoft_office_direct_pkg() {
+    write_log "Начинаю установку Microsoft Office напрямую через официальный pkg."
 
-    local conflicts=(
-        "microsoft-word"
-        "microsoft-excel"
-        "microsoft-powerpoint"
-        "microsoft-outlook"
-        "microsoft-onenote"
-        "onedrive"
-        "microsoft-teams"
-        "microsoft-auto-update"
-    )
+    if [ -d "/Applications/Microsoft Word.app" ] && [ -d "/Applications/Microsoft Excel.app" ] && [ -d "/Applications/Microsoft PowerPoint.app" ]; then
+        write_log "Microsoft Office уже установлен."
+        return 0
+    fi
 
-    for app in "${conflicts[@]}"; do
-        brew list --cask "$app" >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            write_log "Найден конфликтующий Microsoft cask: $app"
-            write_log "Удаляю конфликтующий cask: $app"
-            brew uninstall --cask "$app" --force >> "$LOG_FILE" 2>&1
-        fi
-    done
+    write_log "Скачиваю Microsoft Office pkg."
+    rm -f "$OFFICE_PKG"
 
-    install_brew_cask "Microsoft Office / Microsoft 365 Apps" "microsoft-office"
+    curl -L --fail --connect-timeout 30 --retry 3 --retry-delay 10 -o "$OFFICE_PKG" "$OFFICE_URL" >> "$LOG_FILE" 2>&1
+
+    if [ $? -ne 0 ]; then
+        write_log "ОШИБКА: не удалось скачать Microsoft Office pkg."
+        write_log "Проверь интернет, DNS или доступ к Microsoft CDN."
+        return 1
+    fi
+
+    if [ ! -s "$OFFICE_PKG" ]; then
+        write_log "ОШИБКА: Microsoft Office pkg скачался пустым файлом."
+        return 1
+    fi
+
+    write_log "Устанавливаю Microsoft Office pkg через installer."
+
+    sudo installer -pkg "$OFFICE_PKG" -target / >> "$LOG_FILE" 2>&1
+
+    if [ $? -ne 0 ]; then
+        write_log "ОШИБКА: installer не смог установить Microsoft Office."
+        return 1
+    fi
 
     if [ -d "/Applications/Microsoft Word.app" ] || [ -d "/Applications/Microsoft Excel.app" ]; then
-        write_log "Microsoft Office установлен."
+        write_log "УСПЕШНО: Microsoft Office установлен."
         return 0
     else
-        write_log "Microsoft Office не найден в /Applications после установки."
+        write_log "ОШИБКА: Microsoft Office не найден в /Applications после установки."
         return 1
     fi
 }
@@ -253,70 +254,115 @@ install_microsoft_office() {
 install_forticlient_vpn() {
     write_log "Начинаю установку FortiClient VPN."
 
+    if [ -d "/Applications/FortiClient.app" ]; then
+        write_log "FortiClient уже установлен."
+        return 0
+    fi
+
     load_homebrew_path
 
-    brew list --cask forticlient-vpn >/dev/null 2>&1
+    write_log "Пробую установить FortiClient VPN через Homebrew cask."
 
-    if [ $? -ne 0 ]; then
-        write_log "Устанавливаю FortiClient VPN через Homebrew."
-        brew install --cask forticlient-vpn --no-quarantine >> "$LOG_FILE" 2>&1
-    else
-        write_log "FortiClient VPN cask уже установлен."
-    fi
+    brew install --cask forticlient-vpn --no-quarantine >> "$LOG_FILE" 2>&1
 
     if [ -d "/Applications/FortiClient.app" ]; then
-        write_log "FortiClient VPN установлен: /Applications/FortiClient.app"
+        write_log "УСПЕШНО: FortiClient VPN установлен."
         return 0
     fi
 
-    write_log "Ищу FortiClient installer/update app."
+    write_log "FortiClient.app пока не найден. Ищу FortiClientUpdate.app или Install.app."
 
-    local forti_installer
-    forti_installer="$(find /Applications /opt/homebrew/Caskroom /usr/local/Caskroom -iname "FortiClientUpdate.app" -type d 2>/dev/null | head -n 1)"
+    local forti_app
+    forti_app="$(find /Applications /opt/homebrew/Caskroom /usr/local/Caskroom "$HOME/Downloads" -iname "FortiClientUpdate.app" -type d 2>/dev/null | head -n 1)"
 
-    if [ -n "$forti_installer" ]; then
-        write_log "Найден FortiClientUpdate.app: $forti_installer"
-        write_log "Запускаю FortiClientUpdate.app."
+    if [ -z "$forti_app" ]; then
+        forti_app="$(find /Applications /opt/homebrew/Caskroom /usr/local/Caskroom "$HOME/Downloads" -iname "Install.app" -type d 2>/dev/null | grep -i Forti | head -n 1)"
+    fi
 
-        open "$forti_installer"
+    if [ -n "$forti_app" ]; then
+        write_log "Найден установщик FortiClient: $forti_app"
+        write_log "Открываю установщик FortiClient. Заверши установку в окне."
 
-        write_log "FortiClientUpdate.app открыт. Заверши установку в появившемся окне."
-        write_log "После установки FortiClient может запросить разрешения в Privacy & Security."
+        open "$forti_app"
+
+        write_log "ВАЖНО: после установки FortiClient может попросить разрешения в System Settings -> Privacy & Security."
         return 0
     fi
 
-    local forti_pkg
-    forti_pkg="$(find /Applications /opt/homebrew/Caskroom /usr/local/Caskroom -iname "*Forti*.pkg" -type f 2>/dev/null | head -n 1)"
+    write_log "ОШИБКА: FortiClient VPN не удалось установить автоматически."
+    write_log "Причина обычно в том, что Fortinet использует online-installer, который не всегда работает в silent-режиме."
+    write_log "Скачай FortiClient VPN для macOS с сайта Fortinet или положи DMG/PKG рядом со скриптом."
+    return 1
+}
 
-    if [ -n "$forti_pkg" ]; then
-        write_log "Найден FortiClient pkg: $forti_pkg"
-        write_log "Устанавливаю pkg через installer."
+install_local_forti_if_exists() {
+    write_log "Проверяю локальный FortiClient installer рядом со скриптом."
 
-        sudo installer -pkg "$forti_pkg" -target / >> "$LOG_FILE" 2>&1
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+
+    local local_pkg
+    local local_dmg
+
+    local_pkg="$(find "$script_dir" "$WORK_DIR" "$HOME/Downloads" -maxdepth 1 -iname "*Forti*.pkg" -type f 2>/dev/null | head -n 1)"
+    local_dmg="$(find "$script_dir" "$WORK_DIR" "$HOME/Downloads" -maxdepth 1 -iname "*Forti*.dmg" -type f 2>/dev/null | head -n 1)"
+
+    if [ -n "$local_pkg" ]; then
+        write_log "Найден локальный FortiClient pkg: $local_pkg"
+        sudo installer -pkg "$local_pkg" -target / >> "$LOG_FILE" 2>&1
 
         if [ $? -eq 0 ]; then
-            write_log "FortiClient VPN установлен через pkg."
+            write_log "УСПЕШНО: FortiClient установлен из локального pkg."
             return 0
         else
-            write_log "ОШИБКА установки FortiClient pkg."
+            write_log "ОШИБКА: локальный FortiClient pkg не установился."
             return 1
         fi
     fi
 
-    if [ -d "/Applications/FortiClient.app" ]; then
-        write_log "FortiClient VPN установлен."
-        return 0
-    else
-        write_log "ОШИБКА: FortiClient VPN не установлен автоматически."
-        write_log "Проверь лог: $LOG_FILE"
-        return 1
+    if [ -n "$local_dmg" ]; then
+        write_log "Найден локальный FortiClient dmg: $local_dmg"
+        write_log "Монтирую dmg."
+
+        local mount_point
+        mount_point="$(hdiutil attach "$local_dmg" -nobrowse -quiet | grep "/Volumes/" | sed 's/^.*\/Volumes\//\/Volumes\//' | head -n 1)"
+
+        if [ -z "$mount_point" ]; then
+            write_log "ОШИБКА: не удалось смонтировать FortiClient dmg."
+            return 1
+        fi
+
+        local pkg_in_dmg
+        local app_in_dmg
+
+        pkg_in_dmg="$(find "$mount_point" -iname "*Forti*.pkg" -type f 2>/dev/null | head -n 1)"
+        app_in_dmg="$(find "$mount_point" -iname "Install.app" -type d 2>/dev/null | head -n 1)"
+
+        if [ -n "$pkg_in_dmg" ]; then
+            write_log "Найден pkg внутри dmg: $pkg_in_dmg"
+            sudo installer -pkg "$pkg_in_dmg" -target / >> "$LOG_FILE" 2>&1
+            hdiutil detach "$mount_point" -quiet >> "$LOG_FILE" 2>&1
+            return 0
+        fi
+
+        if [ -n "$app_in_dmg" ]; then
+            write_log "Найден Install.app внутри dmg: $app_in_dmg"
+            open "$app_in_dmg"
+            write_log "Заверши установку FortiClient в открывшемся окне."
+            return 0
+        fi
+
+        hdiutil detach "$mount_point" -quiet >> "$LOG_FILE" 2>&1
     fi
+
+    write_log "Локальный FortiClient installer не найден."
+    return 1
 }
 
 install_applications() {
     install_brew_cask "Adobe Acrobat Reader" "adobe-acrobat-reader"
 
-    install_microsoft_office
+    install_microsoft_office_direct_pkg
 
     install_brew_cask "KeePassXC" "keepassxc"
     install_brew_cask "Freelens" "freelens"
@@ -326,7 +372,10 @@ install_applications() {
     install_brew_cask "Яндекс Телемост" "yandextelemost"
     install_brew_cask "OpenVPN Connect" "openvpn-connect"
 
-    install_forticlient_vpn
+    install_local_forti_if_exists
+    if [ $? -ne 0 ]; then
+        install_forticlient_vpn
+    fi
 
     if [ "$INSTALL_DOCKER_DESKTOP" = true ]; then
         install_brew_cask "Docker Desktop" "docker-desktop"
