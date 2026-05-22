@@ -1,10 +1,5 @@
 #requires -version 5.1
 
-#1) Сначала проверяет наличие winget.
-#2) Если winget отсутствует — пытается восстановить/установить App Installer / Windows Package Manager.
-#3) После появления winget ставит программы.
-#4) FortiClient VPN ставится сначала через winget, затем через локальный/сетевой установщик, если winget-пакет недоступен.
-
 
 $ErrorActionPreference = "Continue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
