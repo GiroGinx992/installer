@@ -23,8 +23,6 @@ $LogFile     = Join-Path $LogDir "install-windows.log"
 
 New-Item -ItemType Directory -Force -Path $BaseDir, $DownloadDir, $LogDir | Out-Null
 
-
-
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)]
@@ -59,7 +57,6 @@ Write-Log "Скрипт запущен от имени администрато�
 Write-Log "Лог файл: $LogFile"
 
 
-
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Write-Log "TLS 1.2 включён."
@@ -72,17 +69,23 @@ catch {
 
 function Get-WingetPath {
     $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+
     if ($cmd) {
         return $cmd.Source
     }
 
-    $possiblePaths = @(
-        "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe",
-        "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe"
-    )
+    $localPath = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"
 
-    foreach ($path in $possiblePaths) {
-        $found = Get-Item $path -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (Test-Path $localPath) {
+        return $localPath
+    }
+
+    $windowsAppsPath = Join-Path $env:ProgramFiles "WindowsApps"
+
+    if (Test-Path $windowsAppsPath) {
+        $found = Get-ChildItem -Path $windowsAppsPath -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
         if ($found) {
             return $found.FullName
         }
@@ -151,7 +154,7 @@ if (-not (Test-Winget)) {
 
     if (-not $installedWinget) {
         Write-Log "Не удалось автоматически установить winget." "ERROR"
-        Write-Log "Проверь Windows Update / Microsoft Store / App Installer и запусти скрипт повторно." "ERROR"
+        Write-Log "Проверь App Installer / Microsoft Store / Windows Update и запусти скрипт повторно." "ERROR"
         exit 1
     }
 }
@@ -169,10 +172,12 @@ function Initialize-Winget {
         Write-Log "Обновляю источники winget..."
         & $Winget source update --accept-source-agreements | Out-Null
 
-        Write-Log "Проверяю доступность источников winget..."
-        & $Winget source list | Out-String | ForEach-Object {
-            if ($_.Trim()) {
-                Write-Log $_.Trim()
+        Write-Log "Проверяю источники winget..."
+        $sources = & $Winget source list 2>$null | Out-String
+
+        foreach ($line in $sources -split "`n") {
+            if ($line.Trim()) {
+                Write-Log $line.Trim()
             }
         }
 
@@ -248,7 +253,7 @@ function Install-WingetPackage {
         }
     }
     catch {
-        Write-Log "Ошибка установки $Name: $($_.Exception.Message)" "ERROR"
+        Write-Log "Ошибка установки ${Name}: $($_.Exception.Message)" "ERROR"
     }
 }
 
@@ -294,7 +299,6 @@ $WingetApps = @(
 foreach ($app in $WingetApps) {
     Install-WingetPackage -Name $app.Name -Id $app.Id
 }
-
 
 
 function Get-GitHubReleaseAssets {
@@ -369,7 +373,7 @@ function Install-ExeFromGitHubRelease {
     $localFile = Join-Path $DownloadDir $fileName
 
     try {
-        Write-Log "Скачиваю $DisplayName: $fileName"
+        Write-Log "Скачиваю ${DisplayName}: $fileName"
         Invoke-WebRequest -Uri $downloadUrl -OutFile $localFile -UseBasicParsing
 
         if (-not (Test-Path $localFile)) {
@@ -401,7 +405,7 @@ function Install-ExeFromGitHubRelease {
         Write-Log "Не удалось тихо установить $DisplayName. Возможно, установщик требует ручного режима." "WARN"
     }
     catch {
-        Write-Log "Ошибка установки $DisplayName из GitHub Release: $($_.Exception.Message)" "ERROR"
+        Write-Log "Ошибка установки ${DisplayName} из GitHub Release: $($_.Exception.Message)" "ERROR"
     }
 }
 
@@ -462,7 +466,6 @@ foreach ($app in $WingetApps) {
 
 Write-Log "Установка завершена." "SUCCESS"
 Write-Log "Лог находится здесь: $LogFile"
-
 Write-Log "ВАЖНО: после установки Docker Desktop, Office или VPN-клиентов может потребоваться перезагрузка Windows." "WARN"
 
 exit 0
