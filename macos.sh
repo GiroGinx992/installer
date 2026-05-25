@@ -121,7 +121,9 @@ get_asset_url_by_pattern() {
             sub(/".*$/, "", line)
             url = line
 
-            if (name ~ pattern) {
+            check = name " " url
+
+            if (check ~ pattern) {
                 print url
                 exit 0
             }
