@@ -2,12 +2,20 @@
 
 # Назначение:
 # Скачать установщики из GitHub Release и установить программы на macOS.
+#
+# Repo:
+# https://github.com/GiroGinx992/installer
+#
+# Запуск:
+# /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/GiroGinx992/installer/main/install/macos.sh)"
 
 set +e
 
 OWNER="GiroGinx992"
 REPO="installer"
 
+# true = брать latest release
+# false = брать конкретный RELEASE_TAG
 USE_LATEST_RELEASE=true
 RELEASE_TAG="onboarding-v1"
 
@@ -15,16 +23,21 @@ BASE_DIR="$HOME/Library/Application Support/OnboardingInstaller"
 DOWNLOAD_DIR="$BASE_DIR/downloads"
 LOG_DIR="$HOME/Library/Logs/OnboardingInstaller"
 LOG_FILE="$LOG_DIR/install-macos.log"
+RELEASE_JSON_FILE="$BASE_DIR/release.json"
 
 mkdir -p "$DOWNLOAD_DIR"
 mkdir -p "$LOG_DIR"
+mkdir -p "$BASE_DIR"
 
 write_log() {
     local message="$1"
     local level="${2:-INFO}"
     local time
     time="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[$time] [$level] $message" | tee -a "$LOG_FILE"
+
+    # ВАЖНО:
+    # Пишем лог в stderr, чтобы он НЕ попадал в release.json
+    echo "[$time] [$level] $message" | tee -a "$LOG_FILE" >&2
 }
 
 command_exists() {
@@ -36,7 +49,7 @@ check_requirements() {
 
     local missing=0
 
-    for cmd in curl python3 hdiutil installer; do
+    for cmd in curl python3 hdiutil installer find du awk grep sed sw_vers; do
         if ! command_exists "$cmd"; then
             write_log "Не найдена команда: $cmd" "ERROR"
             missing=1
@@ -65,6 +78,45 @@ get_release_json() {
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -H "User-Agent: OnboardingInstaller" \
         "$url"
+}
+
+validate_json_file() {
+    local json_file="$1"
+
+    python3 - "$json_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        json.load(f)
+except Exception as e:
+    print(f"JSON_ERROR: {e}")
+    sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
+print_release_assets() {
+    local json_file="$1"
+
+    python3 - "$json_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+print("Release:", data.get("name"))
+print("Tag:", data.get("tag_name"))
+print("Assets:")
+
+for asset in data.get("assets", []):
+    print(" - " + asset.get("name", ""))
+PY
 }
 
 find_asset_url() {
@@ -193,6 +245,20 @@ copy_app_to_applications() {
     fi
 }
 
+detach_dmg() {
+    local volume_path="$1"
+
+    if [[ -n "$volume_path" ]]; then
+        write_log "Отмонтирую DMG: $volume_path"
+        hdiutil detach "$volume_path" -quiet
+
+        if [[ $? -ne 0 ]]; then
+            write_log "Обычное отмонтирование не удалось, пробую force: $volume_path" "WARN"
+            hdiutil detach "$volume_path" -force -quiet
+        fi
+    fi
+}
+
 install_dmg() {
     local dmg_path="$1"
 
@@ -202,7 +268,7 @@ install_dmg() {
     attach_output="$(hdiutil attach "$dmg_path" -nobrowse 2>&1)"
     local attach_code=$?
 
-    echo "$attach_output" | tee -a "$LOG_FILE"
+    echo "$attach_output" | tee -a "$LOG_FILE" >&2
 
     if [[ "$attach_code" -ne 0 ]]; then
         write_log "Ошибка монтирования DMG: $dmg_path" "ERROR"
@@ -210,7 +276,7 @@ install_dmg() {
     fi
 
     local volume_path
-    volume_path="$(echo "$attach_output" | grep "/Volumes/" | tail -n 1 | sed 's/^.*\/Volumes\//\/Volumes\//')"
+    volume_path="$(echo "$attach_output" | awk '/\/Volumes\// {for (i=1;i<=NF;i++) if ($i ~ /^\/Volumes\//) print $i}' | tail -n 1)"
 
     if [[ -z "$volume_path" ]]; then
         write_log "Не удалось определить /Volumes путь для DMG." "ERROR"
@@ -222,8 +288,8 @@ install_dmg() {
     local pkg_path
     local app_path
 
-    pkg_path="$(find "$volume_path" -maxdepth 3 -name "*.pkg" -print -quit)"
-    app_path="$(find "$volume_path" -maxdepth 3 -name "*.app" -print -quit)"
+    pkg_path="$(find "$volume_path" -maxdepth 4 -name "*.pkg" -print -quit 2>/dev/null)"
+    app_path="$(find "$volume_path" -maxdepth 4 -name "*.app" -print -quit 2>/dev/null)"
 
     local result=1
 
@@ -240,8 +306,7 @@ install_dmg() {
         result=1
     fi
 
-    write_log "Отмонтирую DMG: $volume_path"
-    hdiutil detach "$volume_path" -quiet
+    detach_dmg "$volume_path"
 
     return $result
 }
@@ -256,8 +321,8 @@ install_program_from_release() {
     local asset_url
     local asset_name
 
-    asset_url="$(find_asset_url "$RELEASE_JSON_FILE" "$contains")"
-    asset_name="$(find_asset_name "$RELEASE_JSON_FILE" "$contains")"
+    asset_url="$(find_asset_url "$RELEASE_JSON_FILE" "$contains" 2>>"$LOG_FILE")"
+    asset_name="$(find_asset_name "$RELEASE_JSON_FILE" "$contains" 2>>"$LOG_FILE")"
 
     if [[ -z "$asset_url" || -z "$asset_name" ]]; then
         write_log "Файл для $display_name не найден в release. Поиск: $contains" "WARN"
@@ -276,11 +341,13 @@ install_program_from_release() {
     fi
 
     case "$target_path" in
-        *.pkg)
+        *.pkg|*.PKG)
             install_pkg "$target_path"
+            return $?
             ;;
-        *.dmg)
+        *.dmg|*.DMG)
             install_dmg "$target_path"
+            return $?
             ;;
         *)
             write_log "Неподдерживаемый формат: $target_path" "ERROR"
@@ -296,28 +363,37 @@ check_requirements
 MACOS_VERSION="$(sw_vers -productVersion)"
 write_log "macOS version: $MACOS_VERSION"
 
-RELEASE_JSON_FILE="$BASE_DIR/release.json"
+write_log "Очищаю старый release.json"
+rm -f "$RELEASE_JSON_FILE"
 
 get_release_json > "$RELEASE_JSON_FILE"
+release_code=$?
 
-if [[ $? -ne 0 || ! -s "$RELEASE_JSON_FILE" ]]; then
-    write_log "Не удалось получить GitHub Release JSON." "ERROR"
+if [[ "$release_code" -ne 0 ]]; then
+    write_log "Не удалось получить GitHub Release JSON. curl exit code: $release_code" "ERROR"
     exit 1
 fi
 
-write_log "Release JSON сохранен: $RELEASE_JSON_FILE"
+if [[ ! -s "$RELEASE_JSON_FILE" ]]; then
+    write_log "release.json пустой: $RELEASE_JSON_FILE" "ERROR"
+    exit 1
+fi
+
+validate_json_file "$RELEASE_JSON_FILE" >/tmp/onboarding_json_check.txt 2>&1
+
+if [[ $? -ne 0 ]]; then
+    write_log "release.json поврежден или не является JSON." "ERROR"
+    write_log "Первые 10 строк release.json:" "ERROR"
+    head -n 10 "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
+    write_log "Ошибка проверки JSON:" "ERROR"
+    cat /tmp/onboarding_json_check.txt | tee -a "$LOG_FILE" >&2
+    exit 1
+fi
+
+write_log "Release JSON получен и проверен: $RELEASE_JSON_FILE"
 
 write_log "Файлы в release:"
-python3 - "$RELEASE_JSON_FILE" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-for asset in data.get("assets", []):
-    print(" - " + asset.get("name", ""))
-PY
+print_release_assets "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
 
 # =========================
 # Установка программ
