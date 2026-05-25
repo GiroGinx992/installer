@@ -31,7 +31,7 @@ check_requirements() {
 
     local missing=0
 
-    for cmd in curl sed awk grep hdiutil unzip ditto; do
+    for cmd in curl grep sed awk tr hdiutil unzip ditto find; do
         if ! command_exists "$cmd"; then
             write_log "Не найдена команда: $cmd" "ERROR"
             missing=1
@@ -68,16 +68,6 @@ get_release_json() {
                 write_log "GitHub Release успешно получен"
                 return 0
             fi
-
-            if grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"' "$RELEASE_JSON"; then
-                write_log "GitHub вернул Not Found. Проверь OWNER/REPO или публичность репозитория." "ERROR"
-                return 1
-            fi
-
-            if grep -q '"API rate limit exceeded"' "$RELEASE_JSON"; then
-                write_log "GitHub API rate limit exceeded. Попробуй позже или используй токен." "ERROR"
-                return 1
-            fi
         fi
 
         write_log "Не удалось получить Release. Жду 5 секунд..." "WARN"
@@ -100,35 +90,20 @@ show_assets() {
 
 get_asset_url_by_pattern() {
     local pattern="$1"
+    local lower_pattern
+    lower_pattern="$(printf "%s" "$pattern" | tr '[:upper:]' '[:lower:]')"
 
-    awk -v pattern="$pattern" '
-        BEGIN {
-            IGNORECASE = 1
-            name = ""
-            url = ""
-        }
+    grep '"browser_download_url"[[:space:]]*:' "$RELEASE_JSON" \
+        | sed -E 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+        | while read -r url; do
+            local lower_url
+            lower_url="$(printf "%s" "$url" | tr '[:upper:]' '[:lower:]')"
 
-        /"name"[[:space:]]*:/ {
-            line = $0
-            sub(/^.*"name"[[:space:]]*:[[:space:]]*"/, "", line)
-            sub(/".*$/, "", line)
-            name = line
-        }
-
-        /"browser_download_url"[[:space:]]*:/ {
-            line = $0
-            sub(/^.*"browser_download_url"[[:space:]]*:[[:space:]]*"/, "", line)
-            sub(/".*$/, "", line)
-            url = line
-
-            check = name " " url
-
-            if (check ~ pattern) {
-                print url
-                exit 0
-            }
-        }
-    ' "$RELEASE_JSON"
+            if [[ "$lower_url" =~ "$lower_pattern" ]]; then
+                echo "$url"
+                return 0
+            fi
+        done
 }
 
 get_filename_from_url() {
@@ -139,6 +114,40 @@ get_filename_from_url() {
     file="$(printf "%s" "$file" | sed 's/%20/ /g')"
 
     echo "$file"
+}
+
+download_url_to_file() {
+    local url="$1"
+    local output="$2"
+    local title="$3"
+
+    if [ -f "$output" ] && [ -s "$output" ]; then
+        write_log "Файл уже скачан: $output"
+        echo "$output"
+        return 0
+    fi
+
+    write_log "Скачиваю: $title"
+    write_log "URL: $url"
+
+    curl -L \
+        -H "User-Agent: OnboardingInstaller-macOS" \
+        --connect-timeout 30 \
+        --max-time 0 \
+        --retry 3 \
+        --retry-delay 5 \
+        -o "$output" \
+        "$url"
+
+    if [ $? -ne 0 ] || [ ! -s "$output" ]; then
+        write_log "Ошибка скачивания: $title" "ERROR"
+        rm -f "$output"
+        return 1
+    fi
+
+    write_log "Файл скачан: $output"
+    echo "$output"
+    return 0
 }
 
 download_asset() {
@@ -163,34 +172,9 @@ download_asset() {
     output="$DOWNLOAD_DIR/$filename"
 
     write_log "Найден asset: $filename"
-    write_log "Download URL: $url"
 
-    if [ -f "$output" ]; then
-        write_log "Файл уже скачан: $output"
-        echo "$output"
-        return 0
-    fi
-
-    write_log "Скачиваю: $filename"
-
-    curl -L \
-        -H "User-Agent: OnboardingInstaller-macOS" \
-        --connect-timeout 30 \
-        --max-time 0 \
-        --retry 3 \
-        --retry-delay 5 \
-        -o "$output" \
-        "$url"
-
-    if [ $? -ne 0 ] || [ ! -s "$output" ]; then
-        write_log "Ошибка скачивания: $filename" "ERROR"
-        rm -f "$output"
-        return 1
-    fi
-
-    write_log "Файл скачан: $output"
-    echo "$output"
-    return 0
+    download_url_to_file "$url" "$output" "$app_title"
+    return $?
 }
 
 detach_dmg() {
@@ -286,8 +270,8 @@ install_dmg() {
 
     write_log "DMG смонтирован: $mount_point"
 
-    pkg_file="$(find "$mount_point" -maxdepth 4 -name "*.pkg" -type f | head -n 1)"
-    app_file="$(find "$mount_point" -maxdepth 4 -name "*.app" -type d | head -n 1)"
+    pkg_file="$(find "$mount_point" -maxdepth 5 -name "*.pkg" -type f | head -n 1)"
+    app_file="$(find "$mount_point" -maxdepth 5 -name "*.app" -type d | head -n 1)"
 
     if [ -n "$pkg_file" ]; then
         install_pkg_file "$pkg_file" "$app_title"
@@ -382,9 +366,81 @@ install_from_release() {
 
     if [ -n "$file_path" ] && [ -f "$file_path" ]; then
         install_file "$file_path" "$app_title"
+        return $?
     else
         write_log "Пропускаю установку, файл не скачан: $app_title" "WARN"
+        return 1
     fi
+}
+
+download_openvpn_connect_from_brew_api() {
+    local cask_json="$BASE_DIR/openvpn-connect-cask.json"
+    local api_url="https://formulae.brew.sh/api/cask/openvpn-connect.json"
+    local download_url
+    local filename
+    local output
+
+    write_log "OpenVPN Connect не найден в GitHub Release"
+    write_log "Пробую получить ссылку OpenVPN Connect через Homebrew Cask API"
+    write_log "Homebrew устанавливаться не будет"
+
+    curl -L \
+        -H "User-Agent: OnboardingInstaller-macOS" \
+        --connect-timeout 30 \
+        --max-time 120 \
+        -o "$cask_json" \
+        "$api_url"
+
+    if [ $? -ne 0 ] || [ ! -s "$cask_json" ]; then
+        write_log "Не удалось получить Homebrew Cask JSON для OpenVPN Connect" "ERROR"
+        return 1
+    fi
+
+    download_url="$(
+        grep '"url"[[:space:]]*:' "$cask_json" \
+            | head -n 1 \
+            | sed -E 's/.*"url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+            | sed 's#\\/#/#g'
+    )"
+
+    if [ -z "$download_url" ]; then
+        write_log "Не удалось извлечь URL OpenVPN Connect из Cask JSON" "ERROR"
+        return 1
+    fi
+
+    filename="$(get_filename_from_url "$download_url")"
+
+    if [[ "$filename" != *.dmg && "$filename" != *.pkg && "$filename" != *.zip ]]; then
+        filename="OpenVPNConnect.dmg"
+    fi
+
+    output="$DOWNLOAD_DIR/$filename"
+
+    download_url_to_file "$download_url" "$output" "OpenVPN Connect"
+    return $?
+}
+
+install_openvpn_connect() {
+    write_log "Начинаю установку OpenVPN Connect"
+
+    local file_path
+
+    file_path="$(download_asset "openvpn.*connect.*mac.*dmg|openvpn.*connect.*dmg|openvpn.*mac.*dmg|openvpn.*pkg" "OpenVPN Connect")"
+
+    if [ -n "$file_path" ] && [ -f "$file_path" ]; then
+        install_file "$file_path" "OpenVPN Connect"
+        return $?
+    fi
+
+    file_path="$(download_openvpn_connect_from_brew_api)"
+
+    if [ -n "$file_path" ] && [ -f "$file_path" ]; then
+        install_file "$file_path" "OpenVPN Connect"
+        return $?
+    fi
+
+    write_log "OpenVPN Connect не установлен" "ERROR"
+    return 1
 }
 
 write_log "=== Старт установки onboarding ПО для macOS ==="
@@ -399,17 +455,17 @@ fi
 
 show_assets
 
-install_from_release "docker.*\.dmg$" "Docker Desktop"
-install_from_release "forticlient.*\.dmg$" "FortiClient"
-install_from_release "openvpn.*\.dmg$|openvpn.*\.pkg$" "OpenVPN"
-install_from_release "keepassxc.*\.dmg$" "KeePassXC"
-install_from_release "freelens.*\.dmg$" "Freelens"
-install_from_release "slack.*\.dmg$" "Slack"
-install_from_release "postman.*\.zip$|postman.*\.dmg$" "Postman"
-install_from_release "telegram.*\.dmg$|telegram.*\.zip$" "Telegram"
-install_from_release "yandex.*\.dmg$|telemost.*\.dmg$|yandex.*\.pkg$|telemost.*\.pkg$" "Yandex Telemost"
-install_from_release "office.*\.pkg$|microsoft.*office.*\.pkg$|microsoft.*365.*\.pkg$" "Microsoft Office"
-install_from_release "acrobat.*\.dmg$|reader.*\.dmg$|acrobat.*\.pkg$|reader.*\.pkg$" "PDF Reader"
+install_from_release "docker.*\.dmg" "Docker Desktop"
+install_from_release "forticlient.*\.dmg|forti.*\.dmg" "FortiClient"
+install_openvpn_connect
+install_from_release "freelens.*macos.*\.dmg" "Freelens"
+install_from_release "keepassxc.*x86_64.*\.dmg|keepassxc.*\.dmg" "KeePassXC"
+install_from_release "postman.*macos.*\.zip|postman.*mac.*\.zip" "Postman"
+install_from_release "slack.*macos.*\.dmg|slack.*mac.*\.dmg" "Slack"
+
+write_log "Microsoft Office для macOS не установлен: в Release сейчас есть только OfficeSetup.exe для Windows" "WARN"
+write_log "Yandex Telemost для macOS не установлен: в Release сейчас есть только TelemostSetup.exe для Windows" "WARN"
+write_log "PDF Reader для macOS не установлен: в Release сейчас нет .dmg или .pkg" "WARN"
 
 write_log "=== Установка завершена ==="
 write_log "Лог: $LOG_FILE"
