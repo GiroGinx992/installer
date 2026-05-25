@@ -1,31 +1,22 @@
 #!/bin/zsh
 
-# Назначение:
-# Скачать установщики из GitHub Release и установить программы на macOS.
-#
-# Repo:
-# https://github.com/GiroGinx992/installer
-#
-# Запуск:
-# /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/GiroGinx992/installer/main/install/macos.sh)"
-
 set +e
 
 OWNER="GiroGinx992"
 REPO="installer"
 
-# true = брать latest release
-# false = брать конкретный RELEASE_TAG
 USE_LATEST_RELEASE=true
 RELEASE_TAG="onboarding-v1"
 
 BASE_DIR="$HOME/Library/Application Support/OnboardingInstaller"
 DOWNLOAD_DIR="$BASE_DIR/downloads"
+EXTRACT_DIR="$BASE_DIR/extracted"
 LOG_DIR="$HOME/Library/Logs/OnboardingInstaller"
 LOG_FILE="$LOG_DIR/install-macos.log"
 RELEASE_JSON_FILE="$BASE_DIR/release.json"
 
 mkdir -p "$DOWNLOAD_DIR"
+mkdir -p "$EXTRACT_DIR"
 mkdir -p "$LOG_DIR"
 mkdir -p "$BASE_DIR"
 
@@ -34,9 +25,6 @@ write_log() {
     local level="${2:-INFO}"
     local time
     time="$(date '+%Y-%m-%d %H:%M:%S')"
-
-    # ВАЖНО:
-    # Пишем лог в stderr, чтобы он НЕ попадал в release.json
     echo "[$time] [$level] $message" | tee -a "$LOG_FILE" >&2
 }
 
@@ -49,7 +37,7 @@ check_requirements() {
 
     local missing=0
 
-    for cmd in curl python3 hdiutil installer find du awk grep sed sw_vers; do
+    for cmd in curl python3 hdiutil installer find du awk grep sed sw_vers unzip; do
         if ! command_exists "$cmd"; then
             write_log "Не найдена команда: $cmd" "ERROR"
             missing=1
@@ -119,16 +107,20 @@ for asset in data.get("assets", []):
 PY
 }
 
-find_asset_url() {
+find_asset_field() {
     local json_file="$1"
-    local contains="$2"
+    local field="$2"
+    shift 2
 
-    python3 - "$json_file" "$contains" <<'PY'
+    python3 - "$json_file" "$field" "$@" <<'PY'
 import json
 import sys
 
 json_file = sys.argv[1]
-contains = sys.argv[2].lower()
+field = sys.argv[2]
+patterns = [x.lower() for x in sys.argv[3:] if x.strip()]
+
+allowed_extensions = (".dmg", ".pkg", ".zip")
 
 with open(json_file, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -139,37 +131,13 @@ for asset in assets:
     name = asset.get("name", "")
     lower_name = name.lower()
 
-    if contains in lower_name and (lower_name.endswith(".dmg") or lower_name.endswith(".pkg")):
-        print(asset.get("browser_download_url", ""))
-        sys.exit(0)
+    if not lower_name.endswith(allowed_extensions):
+        continue
 
-sys.exit(1)
-PY
-}
-
-find_asset_name() {
-    local json_file="$1"
-    local contains="$2"
-
-    python3 - "$json_file" "$contains" <<'PY'
-import json
-import sys
-
-json_file = sys.argv[1]
-contains = sys.argv[2].lower()
-
-with open(json_file, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-assets = data.get("assets", [])
-
-for asset in assets:
-    name = asset.get("name", "")
-    lower_name = name.lower()
-
-    if contains in lower_name and (lower_name.endswith(".dmg") or lower_name.endswith(".pkg")):
-        print(name)
-        sys.exit(0)
+    for pattern in patterns:
+        if pattern in lower_name:
+            print(asset.get(field, ""))
+            sys.exit(0)
 
 sys.exit(1)
 PY
@@ -288,8 +256,8 @@ install_dmg() {
     local pkg_path
     local app_path
 
-    pkg_path="$(find "$volume_path" -maxdepth 4 -name "*.pkg" -print -quit 2>/dev/null)"
-    app_path="$(find "$volume_path" -maxdepth 4 -name "*.app" -print -quit 2>/dev/null)"
+    pkg_path="$(find "$volume_path" -maxdepth 5 -name "*.pkg" -print -quit 2>/dev/null)"
+    app_path="$(find "$volume_path" -maxdepth 5 -name "*.app" -print -quit 2>/dev/null)"
 
     local result=1
 
@@ -311,9 +279,72 @@ install_dmg() {
     return $result
 }
 
+install_zip() {
+    local zip_path="$1"
+    local name_without_ext
+    name_without_ext="$(basename "$zip_path" .zip)"
+
+    local extract_path="$EXTRACT_DIR/$name_without_ext"
+
+    write_log "Распаковываю ZIP: $zip_path"
+    write_log "Куда: $extract_path"
+
+    rm -rf "$extract_path"
+    mkdir -p "$extract_path"
+
+    unzip -q "$zip_path" -d "$extract_path"
+
+    if [[ $? -ne 0 ]]; then
+        write_log "Ошибка распаковки ZIP: $zip_path" "ERROR"
+        return 1
+    fi
+
+    local pkg_path
+    local app_path
+
+    pkg_path="$(find "$extract_path" -maxdepth 6 -name "*.pkg" -print -quit 2>/dev/null)"
+    app_path="$(find "$extract_path" -maxdepth 6 -name "*.app" -print -quit 2>/dev/null)"
+
+    if [[ -n "$pkg_path" ]]; then
+        write_log "Найден PKG внутри ZIP: $pkg_path"
+        install_pkg "$pkg_path"
+        return $?
+    elif [[ -n "$app_path" ]]; then
+        write_log "Найден APP внутри ZIP: $app_path"
+        copy_app_to_applications "$app_path"
+        return $?
+    else
+        write_log "В ZIP не найден .pkg или .app" "ERROR"
+        return 1
+    fi
+}
+
+install_downloaded_file() {
+    local file_path="$1"
+
+    case "$file_path" in
+        *.pkg|*.PKG)
+            install_pkg "$file_path"
+            return $?
+            ;;
+        *.dmg|*.DMG)
+            install_dmg "$file_path"
+            return $?
+            ;;
+        *.zip|*.ZIP)
+            install_zip "$file_path"
+            return $?
+            ;;
+        *)
+            write_log "Неподдерживаемый формат: $file_path" "ERROR"
+            return 1
+            ;;
+    esac
+}
+
 install_program_from_release() {
     local display_name="$1"
-    local contains="$2"
+    shift
 
     write_log "----------------------------------------"
     write_log "Проверяю программу: $display_name"
@@ -321,11 +352,11 @@ install_program_from_release() {
     local asset_url
     local asset_name
 
-    asset_url="$(find_asset_url "$RELEASE_JSON_FILE" "$contains" 2>>"$LOG_FILE")"
-    asset_name="$(find_asset_name "$RELEASE_JSON_FILE" "$contains" 2>>"$LOG_FILE")"
+    asset_url="$(find_asset_field "$RELEASE_JSON_FILE" "browser_download_url" "$@" 2>>"$LOG_FILE")"
+    asset_name="$(find_asset_field "$RELEASE_JSON_FILE" "name" "$@" 2>>"$LOG_FILE")"
 
     if [[ -z "$asset_url" || -z "$asset_name" ]]; then
-        write_log "Файл для $display_name не найден в release. Поиск: $contains" "WARN"
+        write_log "Файл для $display_name не найден в release. Поиск: $*" "WARN"
         return 0
     fi
 
@@ -340,20 +371,8 @@ install_program_from_release() {
         return 1
     fi
 
-    case "$target_path" in
-        *.pkg|*.PKG)
-            install_pkg "$target_path"
-            return $?
-            ;;
-        *.dmg|*.DMG)
-            install_dmg "$target_path"
-            return $?
-            ;;
-        *)
-            write_log "Неподдерживаемый формат: $target_path" "ERROR"
-            return 1
-            ;;
-    esac
+    install_downloaded_file "$target_path"
+    return $?
 }
 
 write_log "=== Старт macOS onboarding install ==="
@@ -399,15 +418,46 @@ print_release_assets "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
 # Установка программ
 # =========================
 
-install_program_from_release "Docker Desktop" "Docker"
-install_program_from_release "FortiClient VPN" "Forti"
-install_program_from_release "OpenVPN Connect" "OpenVPN"
-install_program_from_release "KeePassXC" "KeePass"
-install_program_from_release "Slack" "Slack"
-install_program_from_release "Postman" "Postman"
-install_program_from_release "Telegram" "Telegram"
-install_program_from_release "Yandex Telemost" "Telemost"
-install_program_from_release "Microsoft Office" "Office"
+install_program_from_release "Docker Desktop" \
+    "docker"
+
+install_program_from_release "FortiClient VPN" \
+    "forti" \
+    "forticlient" \
+    "fortivpn" \
+    "vpn"
+
+install_program_from_release "OpenVPN Connect" \
+    "openvpn" \
+    "open vpn"
+
+install_program_from_release "KeePassXC" \
+    "keepass" \
+    "keepassxc"
+
+install_program_from_release "Slack" \
+    "slack"
+
+install_program_from_release "Postman" \
+    "postman"
+
+install_program_from_release "Telegram" \
+    "telegram" \
+    "tdesktop"
+
+install_program_from_release "Yandex Telemost" \
+    "telemost" \
+    "yandex" \
+    "yandextelemost" \
+    "яндекс" \
+    "телемост"
+
+install_program_from_release "Microsoft Office" \
+    "office" \
+    "microsoft" \
+    "microsoft_365" \
+    "microsoft-365" \
+    "m365"
 
 write_log "=== macOS onboarding install завершен ==="
 write_log "Лог: $LOG_FILE"
