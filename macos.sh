@@ -1,568 +1,561 @@
 #!/bin/zsh
 
-# Назначение:
-# Скачать установщики из GitHub Release и установить программы на macOS.
-#
-# Repo:
-# https://github.com/GiroGinx992/installer
-#
-# Запуск:
-# /bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/GiroGinx992/installer/main/install/macos.sh)"
 
 set +e
 
-OWNER="GiroGinx992"
-REPO="installer"
+GITHUB_OWNER="${GITHUB_OWNER:-GiroGinx992}"
+GITHUB_REPO="${GITHUB_REPO:-installer}"
+GITHUB_TAG="${GITHUB_TAG:-onbording-v1}"
 
-# true = брать latest release
-# false = брать конкретный RELEASE_TAG
-USE_LATEST_RELEASE=true
+SKIP_FORTIVPN=false
+SKIP_YANDEX_TELEMOST=false
 
-# ВАЖНО:
-# У тебя tag в ссылках был onbording-v1, без буквы "a" после bo.
-# Если включишь USE_LATEST_RELEASE=false, используй реальный tag.
-RELEASE_TAG="onbording-v1"
+for arg in "$@"; do
+    case "$arg" in
+        --skip-fortivpn)
+            SKIP_FORTIVPN=true
+            ;;
+        --skip-yandex-telemost)
+            SKIP_YANDEX_TELEMOST=true
+            ;;
+        --owner=*)
+            GITHUB_OWNER="${arg#*=}"
+            ;;
+        --repo=*)
+            GITHUB_REPO="${arg#*=}"
+            ;;
+        --tag=*)
+            GITHUB_TAG="${arg#*=}"
+            ;;
+        *)
+            echo "Неизвестный параметр: $arg"
+            echo "Доступно: --skip-fortivpn --skip-yandex-telemost --owner=OWNER --repo=REPO --tag=TAG"
+            exit 1
+            ;;
+    esac
+done
 
 BASE_DIR="$HOME/Library/Application Support/OnboardingInstaller"
 DOWNLOAD_DIR="$BASE_DIR/downloads"
-EXTRACT_DIR="$BASE_DIR/extracted"
+WORK_DIR="$BASE_DIR/work"
 LOG_DIR="$HOME/Library/Logs/OnboardingInstaller"
 LOG_FILE="$LOG_DIR/install-macos.log"
-RELEASE_JSON_FILE="$BASE_DIR/release.json"
 
-mkdir -p "$BASE_DIR"
-mkdir -p "$DOWNLOAD_DIR"
-mkdir -p "$EXTRACT_DIR"
-mkdir -p "$LOG_DIR"
+mkdir -p "$DOWNLOAD_DIR" "$WORK_DIR" "$LOG_DIR"
+
+touch "$LOG_FILE" 2>/dev/null
 
 write_log() {
     local message="$1"
     local level="${2:-INFO}"
-    local time
-    time="$(date '+%Y-%m-%d %H:%M:%S')"
-
-    # Пишем в stderr, чтобы логи не попадали в release.json
-    echo "[$time] [$level] $message" | tee -a "$LOG_FILE" >&2
+    local time_now
+    time_now="$(date '+%Y-%m-%d %H:%M:%S')"
+    local line="[$time_now] [$level] $message"
+    echo "$line" | tee -a "$LOG_FILE"
 }
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-check_requirements() {
-    write_log "Проверяю системные команды..."
+need_command() {
+    local cmd="$1"
+    if ! command_exists "$cmd"; then
+        write_log "Не найдена системная команда: $cmd" "ERROR"
+        return 1
+    fi
+    return 0
+}
 
-    local missing=0
-
-    for cmd in curl python3 hdiutil installer find du awk grep sed sw_vers unzip; do
-        if ! command_exists "$cmd"; then
-            write_log "Не найдена команда: $cmd" "ERROR"
-            missing=1
+check_required_commands() {
+    local failed=false
+    for cmd in curl hdiutil installer ditto unzip find grep sed awk stat; do
+        if ! need_command "$cmd"; then
+            failed=true
         fi
     done
 
-    if [[ "$missing" -eq 1 ]]; then
-        write_log "Не хватает системных команд. Остановка." "ERROR"
+    if [ "$failed" = true ]; then
+        write_log "Не хватает системных команд. Установка остановлена." "ERROR"
         exit 1
     fi
 }
 
-get_release_json() {
-    local url
+check_macos() {
+    local version arch
+    version="$(sw_vers -productVersion 2>/dev/null)"
+    arch="$(uname -m)"
+    write_log "macOS version: $version"
+    write_log "CPU architecture: $arch"
+}
 
-    if [[ "$USE_LATEST_RELEASE" == true ]]; then
-        url="https://api.github.com/repos/$OWNER/$REPO/releases/latest"
-    else
-        url="https://api.github.com/repos/$OWNER/$REPO/releases/tags/$RELEASE_TAG"
+check_sudo() {
+    write_log "Проверяю sudo-права. macOS может запросить пароль пользователя."
+    sudo -v
+    if [ $? -ne 0 ]; then
+        write_log "Не удалось получить sudo-права. Запусти скрипт под пользователем-администратором." "ERROR"
+        exit 1
     fi
 
-    write_log "Получаю GitHub Release: $url"
+    
+    while true; do
+        sudo -n true 2>/dev/null
+        sleep 60
+        kill -0 "$$" 2>/dev/null || exit
+    done &
+}
+
+normalize_name() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+app_exists() {
+    local app_name="$1"
+
+    if [ -d "/Applications/$app_name.app" ]; then
+        return 0
+    fi
+
+    if [ -d "$HOME/Applications/$app_name.app" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+pkg_id_exists() {
+    local pkg_id="$1"
+
+    if [ -z "$pkg_id" ]; then
+        return 1
+    fi
+
+    pkgutil --pkgs 2>/dev/null | grep -Eiq "^${pkg_id}$"
+    return $?
+}
+
+is_installed() {
+    local display_name="$1"
+    local app_name="$2"
+    local pkg_id="$3"
+
+    if [ -n "$app_name" ] && app_exists "$app_name"; then
+        write_log "Уже установлено: $display_name (/Applications/$app_name.app)" "SUCCESS"
+        return 0
+    fi
+
+    if [ -n "$pkg_id" ] && pkg_id_exists "$pkg_id"; then
+        write_log "Уже установлено: $display_name (pkg: $pkg_id)" "SUCCESS"
+        return 0
+    fi
+
+    return 1
+}
+
+get_release_asset_urls() {
+    local api_url="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tags/${GITHUB_TAG}"
+    write_log "Получаю список файлов GitHub Release: $api_url"
 
     curl -fsSL \
         -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        -H "User-Agent: OnboardingInstaller" \
-        "$url"
+        -H "User-Agent: onboarding-macos-installer" \
+        "$api_url" |
+        grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' |
+        sed -E 's/^"browser_download_url"[[:space:]]*:[[:space:]]*"//; s/"$//'
 }
 
-validate_json_file() {
-    local json_file="$1"
+select_asset_url() {
+    local display_name="$1"
+    local patterns="$2"
+    local allowed_ext_regex="$3"
+    local urls="$4"
+    local arch
+    arch="$(uname -m)"
 
-    python3 - "$json_file" <<'PY'
-import json
-import sys
+    local filtered
+    filtered="$(echo "$urls" | grep -Ei "$allowed_ext_regex" | grep -Eiv '\.(exe|msi|msix|msixbundle)$')"
 
-path = sys.argv[1]
+    local pattern
+    local matches=""
 
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        json.load(f)
-except Exception as e:
-    print(f"JSON_ERROR: {e}")
-    sys.exit(1)
+    IFS='|' read -rA pattern_array <<< "$patterns"
 
-sys.exit(0)
-PY
-}
+    for pattern in "${pattern_array[@]}"; do
+        matches="$(echo "$filtered" | grep -Ei "$pattern")"
+        if [ -n "$matches" ]; then
+            break
+        fi
+    done
 
-print_release_assets() {
-    local json_file="$1"
+    if [ -z "$matches" ]; then
+        write_log "Не найден macOS-файл в GitHub Release для: $display_name" "WARN"
+        return 1
+    fi
 
-    python3 - "$json_file" <<'PY'
-import json
-import sys
+    local preferred=""
 
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
+    if [ "$arch" = "arm64" ]; then
+        preferred="$(echo "$matches" | grep -Ei 'arm64|aarch64|apple.?silicon|silicon' | head -n 1)"
+        if [ -z "$preferred" ]; then
+            preferred="$(echo "$matches" | grep -Eiv 'x64|x86|intel|amd64' | head -n 1)"
+        fi
+    else
+        preferred="$(echo "$matches" | grep -Ei 'x64|x86_64|intel|amd64' | head -n 1)"
+        if [ -z "$preferred" ]; then
+            preferred="$(echo "$matches" | grep -Eiv 'arm64|aarch64|apple.?silicon|silicon' | head -n 1)"
+        fi
+    fi
 
-print("Release:", data.get("name"))
-print("Tag:", data.get("tag_name"))
-print("All assets:")
+    if [ -z "$preferred" ]; then
+        preferred="$(echo "$matches" | head -n 1)"
+    fi
 
-for asset in data.get("assets", []):
-    print(" - " + asset.get("name", ""))
-PY
-}
-
-print_macos_assets() {
-    local json_file="$1"
-
-    python3 - "$json_file" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-print("macOS-compatible assets:")
-
-found = False
-
-for asset in data.get("assets", []):
-    name = asset.get("name", "")
-    lower = name.lower()
-
-    if lower.endswith((".dmg", ".pkg", ".zip")):
-        print(" - " + name)
-        found = True
-
-if not found:
-    print(" - macOS assets not found")
-PY
-}
-
-find_asset_field() {
-    local json_file="$1"
-    local field="$2"
-    shift 2
-
-    python3 - "$json_file" "$field" "$@" <<'PY'
-import json
-import sys
-
-json_file = sys.argv[1]
-field = sys.argv[2]
-patterns = [x.lower() for x in sys.argv[3:] if x.strip()]
-
-allowed_extensions = (".dmg", ".pkg", ".zip")
-
-with open(json_file, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-assets = data.get("assets", [])
-
-# Сначала ищем точные совпадения по переданным паттернам
-for asset in assets:
-    name = asset.get("name", "")
-    lower_name = name.lower()
-
-    if not lower_name.endswith(allowed_extensions):
-        continue
-
-    for pattern in patterns:
-        if pattern in lower_name:
-            print(asset.get(field, ""))
-            sys.exit(0)
-
-sys.exit(1)
-PY
+    echo "$preferred"
+    return 0
 }
 
 download_file() {
     local url="$1"
-    local output="$2"
+    local local_file="$2"
+    local display_name="$3"
 
-    write_log "Скачиваю: $url"
-    write_log "Куда: $output"
+    if [ -f "$local_file" ]; then
+        local size
+        size="$(stat -f%z "$local_file" 2>/dev/null)"
+        if [ -n "$size" ] && [ "$size" -gt 1024 ]; then
+            write_log "Файл уже скачан: $local_file"
+            return 0
+        fi
+    fi
 
-    rm -f "$output"
+    write_log "Скачиваю $display_name"
+    write_log "URL: $url"
+    write_log "Куда: $local_file"
 
-    curl -L --fail --progress-bar -o "$output" "$url"
+    curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$local_file" "$url"
+    local code=$?
 
-    if [[ $? -ne 0 ]]; then
-        write_log "Ошибка скачивания: $url" "ERROR"
+    if [ $code -ne 0 ]; then
+        write_log "Ошибка скачивания $display_name. Код curl: $code" "ERROR"
         return 1
     fi
 
-    if [[ ! -s "$output" ]]; then
-        write_log "Файл не скачался или размер 0: $output" "ERROR"
+    if [ ! -f "$local_file" ]; then
+        write_log "Файл не появился после скачивания: $local_file" "ERROR"
         return 1
     fi
 
-    local size
-    size="$(du -h "$output" | awk '{print $1}')"
-    write_log "Файл скачан: $output ($size)"
-
+    write_log "Файл скачан: $local_file" "SUCCESS"
     return 0
 }
 
 install_pkg() {
-    local pkg_path="$1"
+    local pkg_file="$1"
+    local display_name="$2"
 
-    write_log "Устанавливаю PKG: $pkg_path"
-
-    sudo installer -pkg "$pkg_path" -target /
-
+    write_log "Устанавливаю PKG: $display_name"
+    sudo installer -pkg "$pkg_file" -target /
     local code=$?
 
-    if [[ "$code" -eq 0 ]]; then
-        write_log "PKG установлен успешно."
+    if [ $code -eq 0 ]; then
+        write_log "Успешно установлено через PKG: $display_name" "SUCCESS"
         return 0
-    else
-        write_log "Ошибка установки PKG: $pkg_path. Exit code: $code" "ERROR"
-        return 1
     fi
+
+    write_log "Ошибка установки PKG: $display_name. Код: $code" "ERROR"
+    return 1
 }
 
 copy_app_to_applications() {
     local app_path="$1"
-    local app_name
-    app_name="$(basename "$app_path")"
+    local display_name="$2"
+    local app_base
+    app_base="$(basename "$app_path")"
 
-    local destination="/Applications/$app_name"
+    write_log "Копирую приложение в /Applications: $app_base"
 
-    write_log "Копирую APP: $app_path"
-    write_log "Назначение: $destination"
-
-    if [[ -d "$destination" ]]; then
-        write_log "Приложение уже есть, удаляю старую версию: $destination"
-        sudo rm -rf "$destination"
+    if [ -d "/Applications/$app_base" ]; then
+        write_log "Удаляю старую версию: /Applications/$app_base" "WARN"
+        sudo rm -rf "/Applications/$app_base"
     fi
 
-    sudo cp -R "$app_path" "/Applications/"
-
+    sudo ditto "$app_path" "/Applications/$app_base"
     local code=$?
 
-    if [[ "$code" -eq 0 ]]; then
-        write_log "APP скопирован в /Applications: $app_name"
+    if [ $code -eq 0 ]; then
+        sudo xattr -dr com.apple.quarantine "/Applications/$app_base" 2>/dev/null
+        write_log "Успешно установлено приложение: $display_name" "SUCCESS"
         return 0
-    else
-        write_log "Ошибка копирования APP: $app_name. Exit code: $code" "ERROR"
-        return 1
     fi
-}
 
-detach_dmg() {
-    local volume_path="$1"
-
-    if [[ -n "$volume_path" ]]; then
-        write_log "Отмонтирую DMG: $volume_path"
-        hdiutil detach "$volume_path" -quiet
-
-        if [[ $? -ne 0 ]]; then
-            write_log "Обычное отмонтирование не удалось, пробую force: $volume_path" "WARN"
-            hdiutil detach "$volume_path" -force -quiet
-        fi
-    fi
+    write_log "Ошибка копирования приложения: $display_name. Код: $code" "ERROR"
+    return 1
 }
 
 install_dmg() {
-    local dmg_path="$1"
+    local dmg_file="$1"
+    local display_name="$2"
+    local mount_point=""
 
-    write_log "Монтирую DMG: $dmg_path"
+    write_log "Монтирую DMG: $display_name"
 
-    local attach_output
-    attach_output="$(hdiutil attach "$dmg_path" -nobrowse 2>&1)"
-    local attach_code=$?
+    mount_point="$(hdiutil attach "$dmg_file" -nobrowse -quiet 2>/dev/null | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/")); exit}')"
 
-    echo "$attach_output" | tee -a "$LOG_FILE" >&2
-
-    if [[ "$attach_code" -ne 0 ]]; then
-        write_log "Ошибка монтирования DMG: $dmg_path" "ERROR"
+    if [ -z "$mount_point" ] || [ ! -d "$mount_point" ]; then
+        write_log "Не удалось смонтировать DMG: $dmg_file" "ERROR"
         return 1
     fi
 
-    local volume_path
-    volume_path="$(echo "$attach_output" | awk '/\/Volumes\// {for (i=1;i<=NF;i++) if ($i ~ /^\/Volumes\//) print $i}' | tail -n 1)"
+    write_log "DMG смонтирован: $mount_point"
 
-    if [[ -z "$volume_path" ]]; then
-        write_log "Не удалось определить /Volumes путь для DMG." "ERROR"
-        return 1
-    fi
-
-    write_log "DMG смонтирован: $volume_path"
-
-    local pkg_path
-    local app_path
-
-    pkg_path="$(find "$volume_path" \
-        -path "*/__MACOSX/*" -prune -o \
-        -maxdepth 6 \
-        -name "*.pkg" \
-        -print -quit 2>/dev/null)"
-
-    app_path="$(find "$volume_path" \
-        -path "*/__MACOSX/*" -prune -o \
-        -maxdepth 6 \
-        -name "*.app" \
-        -print -quit 2>/dev/null)"
+    local pkg_inside app_inside
+    pkg_inside="$(find "$mount_point" -maxdepth 3 -type f -name '*.pkg' | head -n 1)"
+    app_inside="$(find "$mount_point" -maxdepth 3 -type d -name '*.app' | head -n 1)"
 
     local result=1
 
-    if [[ -n "$pkg_path" ]]; then
-        write_log "Найден PKG внутри DMG: $pkg_path"
-        install_pkg "$pkg_path"
+    if [ -n "$pkg_inside" ]; then
+        install_pkg "$pkg_inside" "$display_name"
         result=$?
-    elif [[ -n "$app_path" ]]; then
-        write_log "Найден APP внутри DMG: $app_path"
-
-        local app_base_name
-        app_base_name="$(basename "$app_path")"
-
-        # Forti online installer часто является не готовым приложением, а GUI-загрузчиком.
-        # Скрипт может скопировать .app, но это не равно полноценной silent-установке FortiVPN.
-        if echo "$app_base_name" | grep -qi "forti"; then
-            write_log "Обнаружен Forti .app внутри DMG: $app_base_name" "WARN"
-            write_log "Если это OnlineInstaller, он может требовать ручной GUI-запуск." "WARN"
-        fi
-
-        copy_app_to_applications "$app_path"
+    elif [ -n "$app_inside" ]; then
+        copy_app_to_applications "$app_inside" "$display_name"
         result=$?
     else
-        write_log "В DMG не найден .pkg или .app" "ERROR"
+        write_log "В DMG не найден .app или .pkg: $display_name" "ERROR"
         result=1
     fi
 
-    detach_dmg "$volume_path"
+    write_log "Отмонтирую DMG: $mount_point"
+    hdiutil detach "$mount_point" -quiet 2>/dev/null
+    if [ $? -ne 0 ]; then
+        hdiutil detach "$mount_point" -force -quiet 2>/dev/null
+    fi
 
     return $result
 }
 
 install_zip() {
-    local zip_path="$1"
-    local name_without_ext
-    name_without_ext="$(basename "$zip_path" .zip)"
+    local zip_file="$1"
+    local display_name="$2"
+    local extract_dir="$WORK_DIR/$(basename "$zip_file" .zip)-extract"
 
-    local extract_path="$EXTRACT_DIR/$name_without_ext"
+    write_log "Распаковываю ZIP: $zip_file"
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
 
-    write_log "Распаковываю ZIP: $zip_path"
-    write_log "Куда: $extract_path"
+    unzip -oq "$zip_file" -d "$extract_dir"
+    local code=$?
 
-    rm -rf "$extract_path"
-    mkdir -p "$extract_path"
-
-    unzip -q "$zip_path" -d "$extract_path"
-
-    if [[ $? -ne 0 ]]; then
-        write_log "Ошибка распаковки ZIP: $zip_path" "ERROR"
+    if [ $code -ne 0 ]; then
+        write_log "Ошибка распаковки ZIP: $display_name. Код: $code" "ERROR"
         return 1
     fi
 
-    local pkg_path
-    local app_path
+    local pkg_inside app_inside
+    pkg_inside="$(find "$extract_dir" -maxdepth 5 -type f -name '*.pkg' | head -n 1)"
+    app_inside="$(find "$extract_dir" -maxdepth 5 -type d -name '*.app' | head -n 1)"
 
-    # ВАЖНО:
-    # Игнорируем __MACOSX, потому что это служебная папка архива.
-    pkg_path="$(find "$extract_path" \
-        -path "*/__MACOSX/*" -prune -o \
-        -name "*.pkg" \
-        -print -quit 2>/dev/null)"
-
-    app_path="$(find "$extract_path" \
-        -path "*/__MACOSX/*" -prune -o \
-        -name "*.app" \
-        -print -quit 2>/dev/null)"
-
-    if [[ -n "$pkg_path" ]]; then
-        write_log "Найден PKG внутри ZIP: $pkg_path"
-        install_pkg "$pkg_path"
+    if [ -n "$pkg_inside" ]; then
+        install_pkg "$pkg_inside" "$display_name"
         return $?
-    elif [[ -n "$app_path" ]]; then
-        write_log "Найден APP внутри ZIP: $app_path"
-        copy_app_to_applications "$app_path"
-        return $?
-    else
-        write_log "В ZIP не найден нормальный .pkg или .app, кроме __MACOSX" "ERROR"
-        return 1
     fi
+
+    if [ -n "$app_inside" ]; then
+        copy_app_to_applications "$app_inside" "$display_name"
+        return $?
+    fi
+
+    write_log "В ZIP не найден .app или .pkg: $display_name" "ERROR"
+    return 1
 }
 
-install_downloaded_file() {
-    local file_path="$1"
+install_local_file() {
+    local file="$1"
+    local display_name="$2"
+    local lower
+    lower="$(normalize_name "$file")"
 
-    case "$file_path" in
-        *.pkg|*.PKG)
-            install_pkg "$file_path"
+    case "$lower" in
+        *.dmg)
+            install_dmg "$file" "$display_name"
             return $?
             ;;
-        *.dmg|*.DMG)
-            install_dmg "$file_path"
+        *.pkg)
+            install_pkg "$file" "$display_name"
             return $?
             ;;
-        *.zip|*.ZIP)
-            install_zip "$file_path"
+        *.zip)
+            install_zip "$file" "$display_name"
             return $?
             ;;
         *)
-            write_log "Неподдерживаемый формат: $file_path" "ERROR"
+            write_log "Неподдерживаемый формат файла для macOS: $file" "ERROR"
             return 1
             ;;
     esac
 }
 
-install_program_from_release() {
+install_app_from_github_release() {
     local display_name="$1"
-    shift
+    local app_name="$2"
+    local pkg_id="$3"
+    local patterns="$4"
+    local allowed_ext_regex='\.(dmg|pkg|zip)$'
 
-    write_log "----------------------------------------"
-    write_log "Проверяю программу: $display_name"
+    write_log "=============================="
+    write_log "Проверяю: $display_name"
 
-    local asset_url
-    local asset_name
-
-    asset_url="$(find_asset_field "$RELEASE_JSON_FILE" "browser_download_url" "$@" 2>>"$LOG_FILE")"
-    asset_name="$(find_asset_field "$RELEASE_JSON_FILE" "name" "$@" 2>>"$LOG_FILE")"
-
-    if [[ -z "$asset_url" || -z "$asset_name" ]]; then
-        write_log "Файл для $display_name не найден в release. Поиск: $*" "WARN"
+    if is_installed "$display_name" "$app_name" "$pkg_id"; then
         return 0
     fi
 
-    write_log "Найден asset: $asset_name"
+    local url
+    url="$(select_asset_url "$display_name" "$patterns" "$allowed_ext_regex" "$RELEASE_URLS")"
 
-    local target_path="$DOWNLOAD_DIR/$asset_name"
-
-    download_file "$asset_url" "$target_path"
-
-    if [[ $? -ne 0 ]]; then
-        write_log "Пропускаю $display_name из-за ошибки скачивания." "ERROR"
+    if [ -z "$url" ]; then
+        write_log "Пропускаю: $display_name" "WARN"
         return 1
     fi
 
-    install_downloaded_file "$target_path"
+    local file_name local_file
+    file_name="$(basename "$url")"
+    local_file="$DOWNLOAD_DIR/$file_name"
 
-    local install_code=$?
-
-    if [[ "$install_code" -eq 0 ]]; then
-        write_log "Готово: $display_name"
-    else
-        write_log "Установка завершилась с ошибкой: $display_name" "ERROR"
+    if ! download_file "$url" "$local_file" "$display_name"; then
+        return 1
     fi
 
-    return $install_code
+    install_local_file "$local_file" "$display_name"
+    local code=$?
+
+    if [ $code -eq 0 ]; then
+        write_log "Готово: $display_name" "SUCCESS"
+    else
+        write_log "Не удалось установить: $display_name" "ERROR"
+    fi
+
+    return $code
 }
 
-write_log "=== Старт macOS onboarding install ==="
+main() {
+    write_log "=== Старт установки onboarding ПО для macOS ==="
+    write_log "GitHub: ${GITHUB_OWNER}/${GITHUB_REPO}, tag: ${GITHUB_TAG}"
+    write_log "Лог файл: $LOG_FILE"
 
-check_requirements
+    check_required_commands
+    check_macos
+    check_sudo
 
-MACOS_VERSION="$(sw_vers -productVersion)"
-write_log "macOS version: $MACOS_VERSION"
+    RELEASE_URLS="$(get_release_asset_urls)"
 
-write_log "Очищаю старый release.json"
-rm -f "$RELEASE_JSON_FILE"
+    if [ -z "$RELEASE_URLS" ]; then
+        write_log "Не удалось получить список файлов из GitHub Release или Release пустой." "ERROR"
+        exit 1
+    fi
 
-get_release_json > "$RELEASE_JSON_FILE"
-release_code=$?
+    write_log "Файлы GitHub Release получены." "SUCCESS"
 
-if [[ "$release_code" -ne 0 ]]; then
-    write_log "Не удалось получить GitHub Release JSON. curl exit code: $release_code" "ERROR"
-    exit 1
-fi
+    install_app_from_github_release \
+        "Adobe Acrobat Reader / PDF Reader" \
+        "Adobe Acrobat Reader" \
+        "com.adobe.acrobat.DC.reader.app.pkg.MUI" \
+        "acrobat|adobe.*reader|reader|pdf"
 
-if [[ ! -s "$RELEASE_JSON_FILE" ]]; then
-    write_log "release.json пустой: $RELEASE_JSON_FILE" "ERROR"
-    exit 1
-fi
+    install_app_from_github_release \
+        "Microsoft Office 365" \
+        "Microsoft Word" \
+        "com.microsoft.package.Microsoft_Office" \
+        "microsoft.*office|office.*installer|office|microsoft.*365|365"
 
-validate_json_file "$RELEASE_JSON_FILE" >/tmp/onboarding_json_check.txt 2>&1
+    install_app_from_github_release \
+        "KeePassXC" \
+        "KeePassXC" \
+        "" \
+        "keepassxc|keepass"
 
-if [[ $? -ne 0 ]]; then
-    write_log "release.json поврежден или не является JSON." "ERROR"
-    write_log "Первые 10 строк release.json:" "ERROR"
-    head -n 10 "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
-    write_log "Ошибка проверки JSON:" "ERROR"
-    cat /tmp/onboarding_json_check.txt | tee -a "$LOG_FILE" >&2
-    exit 1
-fi
+    install_app_from_github_release \
+        "Freelens" \
+        "Freelens" \
+        "" \
+        "freelens"
 
-write_log "Release JSON получен и проверен: $RELEASE_JSON_FILE"
+    install_app_from_github_release \
+        "Slack" \
+        "Slack" \
+        "" \
+        "slack"
 
-write_log "Все файлы в release:"
-print_release_assets "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
+    install_app_from_github_release \
+        "Docker Desktop" \
+        "Docker" \
+        "com.docker.pkg.docker" \
+        "docker.*desktop|docker"
 
-write_log "macOS-файлы в release:"
-print_macos_assets "$RELEASE_JSON_FILE" | tee -a "$LOG_FILE" >&2
+    install_app_from_github_release \
+        "Postman" \
+        "Postman" \
+        "" \
+        "postman"
 
-# =========================
-# Установка программ
-# =========================
+    install_app_from_github_release \
+        "Telegram" \
+        "Telegram" \
+        "" \
+        "telegram"
 
-install_program_from_release "Docker Desktop" \
-    "docker" \
-    "docker desktop"
+    install_app_from_github_release \
+        "OpenVPN Connect" \
+        "OpenVPN Connect" \
+        "net.openvpn.client.app" \
+        "openvpn.*connect|openvpn"
 
-install_program_from_release "FortiClient VPN" \
-    "forticlient" \
-    "forticlientvpn" \
-    "forticlient_vpn" \
-    "forticlient-vpn" \
-    "forti"
+    if [ "$SKIP_FORTIVPN" = false ]; then
+        install_app_from_github_release \
+            "FortiVPN / FortiClient VPN" \
+            "FortiClient" \
+            "com.fortinet.forticlient" \
+            "forti.*client|forti.*vpn|forticlient|fortivpn"
+    else
+        write_log "FortiVPN пропущен параметром --skip-fortivpn" "WARN"
+    fi
 
-install_program_from_release "OpenVPN Connect" \
-    "openvpn" \
-    "openvpnconnect" \
-    "openvpn_connect" \
-    "openvpn-connect" \
-    "open vpn" \
-    "open-vpn"
+    if [ "$SKIP_YANDEX_TELEMOST" = false ]; then
+        install_app_from_github_release \
+            "Яндекс Телемост" \
+            "Телемост" \
+            "" \
+            "telem|telemost|yandex.*telemost|yandex.*meet|яндекс|телемост"
+    else
+        write_log "Яндекс Телемост пропущен параметром --skip-yandex-telemost" "WARN"
+    fi
 
-install_program_from_release "KeePassXC" \
-    "keepass" \
-    "keepassxc"
+    write_log "=============================="
+    write_log "Проверка установленных приложений в /Applications"
 
-install_program_from_release "Slack" \
-    "slack"
+    for app in \
+        "Adobe Acrobat Reader" \
+        "Microsoft Word" \
+        "KeePassXC" \
+        "Freelens" \
+        "Slack" \
+        "Docker" \
+        "Postman" \
+        "Telegram" \
+        "OpenVPN Connect" \
+        "FortiClient" \
+        "Телемост"
+    do
+        if app_exists "$app"; then
+            write_log "OK: $app" "SUCCESS"
+        else
+            write_log "Не найдено в /Applications: $app" "WARN"
+        fi
+    done
 
-install_program_from_release "Postman" \
-    "postman"
+    write_log "Установка завершена." "SUCCESS"
+    write_log "Лог находится здесь: $LOG_FILE"
+   
+}
 
-install_program_from_release "Telegram" \
-    "telegram" \
-    "tdesktop" \
-    "telegram-desktop" \
-    "telegramdesktop" \
-    "telegram for macos" \
-    "telegram-macos"
-
-install_program_from_release "Yandex Telemost" \
-    "telemost" \
-    "yandextelemost" \
-    "yandex-telemost" \
-    "yandex_telemost" \
-    "yandex telemost" \
-    "яндекс" \
-    "телемост"
-
-install_program_from_release "Microsoft Office" \
-    "microsoft office" \
-    "microsoft_office" \
-    "microsoft-office" \
-    "office" \
-    "microsoft_365" \
-    "microsoft-365" \
-    "m365" \
-    "office365"
-
-write_log "=== macOS onboarding install завершен ==="
-write_log "Лог: $LOG_FILE"
+main
+exit 0
