@@ -14,8 +14,6 @@ param(
 $ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
 
-
-
 $BaseDir     = Join-Path $env:ProgramData "OnboardingInstaller"
 $DownloadDir = Join-Path $BaseDir "downloads"
 $LogDir      = Join-Path $BaseDir "logs"
@@ -39,8 +37,6 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -Encoding UTF8
 }
 
-
-
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -48,24 +44,21 @@ function Test-IsAdmin {
 }
 
 if (-not (Test-IsAdmin)) {
-    Write-Log "Скрипт должен быть запущен от имени администратора." "ERROR"
-    Write-Log "Открой PowerShell от имени администратора и запусти команду ещё раз." "ERROR"
+    Write-Log "Скрипт нужно запускать от имени администратора." "ERROR"
+    Write-Log "Открой PowerShell от имени администратора и запусти команду повторно." "ERROR"
     exit 1
 }
 
 Write-Log "Скрипт запущен от имени администратора." "SUCCESS"
 Write-Log "Лог файл: $LogFile"
 
-
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Write-Log "TLS 1.2 включён."
 }
 catch {
-    Write-Log "Не удалось включить TLS 1.2: $($_.Exception.Message)" "WARN"
+    Write-Log "Не удалось включить TLS 1.2, продолжаю работу." "WARN"
 }
-
-
 
 function Get-WingetPath {
     $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -80,14 +73,19 @@ function Get-WingetPath {
         return $localPath
     }
 
-    $windowsAppsPath = Join-Path $env:ProgramFiles "WindowsApps"
+    $programFilesWindowsApps = Join-Path $env:ProgramFiles "WindowsApps"
 
-    if (Test-Path $windowsAppsPath) {
-        $found = Get-ChildItem -Path $windowsAppsPath -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+    if (Test-Path $programFilesWindowsApps) {
+        try {
+            $found = Get-ChildItem -Path $programFilesWindowsApps -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
 
-        if ($found) {
-            return $found.FullName
+            if ($found) {
+                return $found.FullName
+            }
+        }
+        catch {
+            return $null
         }
     }
 
@@ -102,101 +100,180 @@ function Test-Winget {
     }
 
     try {
-        & $wingetPath --version | Out-Null
-        return $true
+        $version = & $wingetPath --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and $version) {
+            return $true
+        }
+
+        return $false
     }
     catch {
         return $false
     }
 }
 
+function Install-WingetUsingMicrosoftModule {
+    Write-Log "Пробую установить winget через Microsoft.WinGet.Client..."
 
+    try {
+        $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
 
-function Install-Winget {
-    Write-Log "winget не найден. Начинаю установку App Installer / winget..." "WARN"
+        if (-not $nuget) {
+            Write-Log "Устанавливаю NuGet provider..."
+            Install-PackageProvider -Name NuGet -Force -Scope AllUsers -ErrorAction Stop | Out-Null
+        }
+
+        try {
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Не удалось изменить политику PSGallery, продолжаю." "WARN"
+        }
+
+        $module = Get-Module -ListAvailable -Name Microsoft.WinGet.Client | Select-Object -First 1
+
+        if (-not $module) {
+            Write-Log "Устанавливаю модуль Microsoft.WinGet.Client..."
+            Install-Module -Name Microsoft.WinGet.Client -Force -AllowClobber -Scope AllUsers -ErrorAction Stop
+        }
+
+        Import-Module Microsoft.WinGet.Client -Force -ErrorAction Stop
+
+        $cmd = Get-Command Repair-WinGetPackageManager -ErrorAction SilentlyContinue
+
+        if (-not $cmd) {
+            Write-Log "Команда Repair-WinGetPackageManager недоступна." "WARN"
+            return $false
+        }
+
+        Write-Log "Восстанавливаю/устанавливаю winget вместе с зависимостями..."
+
+        try {
+            Repair-WinGetPackageManager -AllUsers -ErrorAction Stop | Out-Null
+        }
+        catch {
+            try {
+                Repair-WinGetPackageManager -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Write-Log "Метод Microsoft.WinGet.Client не смог установить winget." "WARN"
+                return $false
+            }
+        }
+
+        Start-Sleep -Seconds 5
+
+        if (Test-Winget) {
+            Write-Log "winget успешно установлен через Microsoft.WinGet.Client." "SUCCESS"
+            return $true
+        }
+
+        Write-Log "Microsoft.WinGet.Client завершился, но winget пока не найден." "WARN"
+        return $false
+    }
+    catch {
+        Write-Log "Не удалось установить winget через Microsoft.WinGet.Client." "WARN"
+        return $false
+    }
+}
+
+function Install-WingetUsingMsixBundle {
+    Write-Log "Пробую установить winget через официальный msixbundle..."
 
     $wingetBundle = Join-Path $DownloadDir "Microsoft.DesktopAppInstaller.msixbundle"
     $wingetUrl = "https://aka.ms/getwinget"
 
     try {
-        Write-Log "Скачиваю winget: $wingetUrl"
-        Invoke-WebRequest -Uri $wingetUrl -OutFile $wingetBundle -UseBasicParsing
+        Write-Log "Скачиваю App Installer / winget..."
+        Invoke-WebRequest -Uri $wingetUrl -OutFile $wingetBundle -UseBasicParsing -ErrorAction Stop
 
         if (-not (Test-Path $wingetBundle)) {
-            Write-Log "Файл winget не скачался: $wingetBundle" "ERROR"
+            Write-Log "Файл App Installer не был скачан." "WARN"
             return $false
         }
 
         Write-Log "Устанавливаю App Installer / winget..."
-        Add-AppxPackage -Path $wingetBundle -ErrorAction Stop
+
+        try {
+            Add-AppxPackage -Path $wingetBundle -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Windows не смог установить App Installer. Обычно причина: нет Windows App Runtime или система не обновлена." "WARN"
+            Write-Log "Продолжаю без вывода технической ошибки HRESULT." "WARN"
+            return $false
+        }
 
         Start-Sleep -Seconds 5
 
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                    [System.Environment]::GetEnvironmentVariable("Path", "User")
-
         if (Test-Winget) {
-            Write-Log "winget успешно установлен." "SUCCESS"
+            Write-Log "winget успешно установлен через msixbundle." "SUCCESS"
             return $true
         }
 
-        Write-Log "winget установлен, но пока не найден в PATH. Возможно, нужен перезапуск PowerShell или Windows." "WARN"
+        Write-Log "App Installer установлен, но winget пока не найден." "WARN"
         return $false
     }
     catch {
-        Write-Log "Ошибка установки winget: $($_.Exception.Message)" "ERROR"
+        Write-Log "Не удалось скачать или установить App Installer." "WARN"
         return $false
     }
 }
 
-if (-not (Test-Winget)) {
-    $installedWinget = Install-Winget
-
-    if (-not $installedWinget) {
-        Write-Log "Не удалось автоматически установить winget." "ERROR"
-        Write-Log "Проверь App Installer / Microsoft Store / Windows Update и запусти скрипт повторно." "ERROR"
-        exit 1
+function Install-WingetIfNeeded {
+    if (Test-Winget) {
+        Write-Log "winget уже установлен." "SUCCESS"
+        return $true
     }
+
+    Write-Log "winget не найден. Начинаю корректную установку зависимостей и winget..." "WARN"
+
+    $resultModule = Install-WingetUsingMicrosoftModule
+
+    if ($resultModule -and (Test-Winget)) {
+        return $true
+    }
+
+    $resultMsix = Install-WingetUsingMsixBundle
+
+    if ($resultMsix -and (Test-Winget)) {
+        return $true
+    }
+
+    Write-Log "winget не удалось установить автоматически." "ERROR"
+    Write-Log "Причина обычно в том, что Windows слишком свежая/чистая и не имеет нужных компонентов Microsoft Store." "ERROR"
+    Write-Log "Решение: запусти Windows Update, обнови Microsoft Store/App Installer и повтори запуск скрипта." "ERROR"
+
+    return $false
+}
+
+$WingetReady = Install-WingetIfNeeded
+
+if (-not $WingetReady) {
+    Write-Log "Установка программ через winget невозможна. Скрипт продолжит только установку программ из GitHub Release." "WARN"
 }
 else {
-    Write-Log "winget найден." "SUCCESS"
-}
+    $Winget = Get-WingetPath
+    Write-Log "Путь к winget: $Winget"
 
-$Winget = Get-WingetPath
-Write-Log "Путь к winget: $Winget"
-
-
-
-function Initialize-Winget {
     try {
         Write-Log "Обновляю источники winget..."
-        & $Winget source update --accept-source-agreements | Out-Null
-
-        Write-Log "Проверяю источники winget..."
-        $sources = & $Winget source list 2>$null | Out-String
-
-        foreach ($line in $sources -split "`n") {
-            if ($line.Trim()) {
-                Write-Log $line.Trim()
-            }
-        }
-
-        Write-Log "winget готов к работе." "SUCCESS"
+        & $Winget source update --accept-source-agreements 2>$null | Out-Null
+        Write-Log "Источники winget обновлены." "SUCCESS"
     }
     catch {
-        Write-Log "Ошибка инициализации winget: $($_.Exception.Message)" "WARN"
+        Write-Log "Не удалось обновить источники winget. Продолжаю." "WARN"
     }
 }
-
-Initialize-Winget
-
-
 
 function Test-WingetPackageInstalled {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Id
     )
+
+    if (-not $WingetReady) {
+        return $false
+    }
 
     try {
         $output = & $Winget list --id $Id -e --accept-source-agreements 2>$null | Out-String
@@ -220,6 +297,11 @@ function Install-WingetPackage {
         [Parameter(Mandatory = $true)]
         [string]$Id
     )
+
+    if (-not $WingetReady) {
+        Write-Log "Пропускаю $Name, потому что winget недоступен." "WARN"
+        return
+    }
 
     Write-Log "Проверяю: $Name [$Id]"
 
@@ -249,11 +331,11 @@ function Install-WingetPackage {
             Write-Log "Успешно установлено: $Name" "SUCCESS"
         }
         else {
-            Write-Log "winget вернул код $exitCode для $Name" "WARN"
+            Write-Log "Не удалось установить $Name через winget. Код: $exitCode" "WARN"
         }
     }
     catch {
-        Write-Log "Ошибка установки ${Name}: $($_.Exception.Message)" "ERROR"
+        Write-Log "Ошибка установки ${Name}. Продолжаю установку остальных программ." "WARN"
     }
 }
 
@@ -300,7 +382,6 @@ foreach ($app in $WingetApps) {
     Install-WingetPackage -Name $app.Name -Id $app.Id
 }
 
-
 function Get-GitHubReleaseAssets {
     param(
         [Parameter(Mandatory = $true)]
@@ -316,12 +397,12 @@ function Get-GitHubReleaseAssets {
     $apiUrl = "https://api.github.com/repos/$Owner/$Repo/releases/tags/$Tag"
 
     try {
-        Write-Log "Получаю список файлов GitHub Release: $apiUrl"
-        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
+        Write-Log "Получаю список файлов GitHub Release..."
+        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -ErrorAction Stop
         return $release.assets
     }
     catch {
-        Write-Log "Не удалось получить GitHub Release: $($_.Exception.Message)" "ERROR"
+        Write-Log "Не удалось получить GitHub Release. Проверь repo/tag/интернет." "WARN"
         return @()
     }
 }
@@ -347,7 +428,7 @@ function Install-ExeFromGitHubRelease {
     $assets = Get-GitHubReleaseAssets -Owner $GitHubOwner -Repo $GitHubRepo -Tag $GitHubTag
 
     if (-not $assets -or $assets.Count -eq 0) {
-        Write-Log "Нет файлов в GitHub Release или не удалось их получить." "WARN"
+        Write-Log "Нет доступных файлов GitHub Release для $DisplayName." "WARN"
         return
     }
 
@@ -374,10 +455,10 @@ function Install-ExeFromGitHubRelease {
 
     try {
         Write-Log "Скачиваю ${DisplayName}: $fileName"
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $localFile -UseBasicParsing
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $localFile -UseBasicParsing -ErrorAction Stop
 
         if (-not (Test-Path $localFile)) {
-            Write-Log "Файл не скачался: $localFile" "ERROR"
+            Write-Log "Файл не скачался: $localFile" "WARN"
             return
         }
 
@@ -387,29 +468,28 @@ function Install-ExeFromGitHubRelease {
             Write-Log "Пробую тихую установку $DisplayName с аргументами: $silentArgs"
 
             try {
-                $process = Start-Process -FilePath $localFile -ArgumentList $silentArgs -Wait -PassThru
+                $process = Start-Process -FilePath $localFile -ArgumentList $silentArgs -Wait -PassThru -ErrorAction Stop
 
                 if ($process.ExitCode -eq 0) {
                     Write-Log "Успешно установлено: $DisplayName" "SUCCESS"
                     return
                 }
                 else {
-                    Write-Log "$DisplayName вернул код: $($process.ExitCode)" "WARN"
+                    Write-Log "$DisplayName не установился с этими аргументами. Код: $($process.ExitCode)" "WARN"
                 }
             }
             catch {
-                Write-Log "Попытка установки не удалась: $($_.Exception.Message)" "WARN"
+                Write-Log "Эта попытка тихой установки $DisplayName не сработала. Пробую следующий вариант." "WARN"
             }
         }
 
-        Write-Log "Не удалось тихо установить $DisplayName. Возможно, установщик требует ручного режима." "WARN"
+        Write-Log "$DisplayName скачан, но тихо не установился. Возможно, установщик требует ручной запуск." "WARN"
+        Write-Log "Файл для ручной установки: $localFile" "WARN"
     }
     catch {
-        Write-Log "Ошибка установки ${DisplayName} из GitHub Release: $($_.Exception.Message)" "ERROR"
+        Write-Log "Не удалось скачать или установить ${DisplayName}." "WARN"
     }
 }
-
-
 
 if (-not $SkipFortiVPN) {
     Install-ExeFromGitHubRelease `
@@ -426,10 +506,8 @@ if (-not $SkipFortiVPN) {
         )
 }
 else {
-    Write-Log "FortiVPN пропущен параметром -SkipFortiVPN" "WARN"
+    Write-Log "FortiVPN пропущен." "WARN"
 }
-
-
 
 if (-not $SkipYandexTelemost) {
     Install-ExeFromGitHubRelease `
@@ -448,24 +526,27 @@ if (-not $SkipYandexTelemost) {
         )
 }
 else {
-    Write-Log "Яндекс Телемост пропущен параметром -SkipYandexTelemost" "WARN"
+    Write-Log "Яндекс Телемост пропущен." "WARN"
 }
 
+Write-Log "Финальная проверка программ winget..."
 
-
-Write-Log "Проверяю установленные приложения через winget..."
-
-foreach ($app in $WingetApps) {
-    if (Test-WingetPackageInstalled -Id $app.Id) {
-        Write-Log "OK: $($app.Name)" "SUCCESS"
-    }
-    else {
-        Write-Log "Не подтверждено через winget: $($app.Name)" "WARN"
+if ($WingetReady) {
+    foreach ($app in $WingetApps) {
+        if (Test-WingetPackageInstalled -Id $app.Id) {
+            Write-Log "OK: $($app.Name)" "SUCCESS"
+        }
+        else {
+            Write-Log "Не подтверждено через winget: $($app.Name)" "WARN"
+        }
     }
 }
+else {
+    Write-Log "Финальная проверка winget-программ пропущена, потому что winget недоступен." "WARN"
+}
 
-Write-Log "Установка завершена." "SUCCESS"
+Write-Log "Работа скрипта завершена." "SUCCESS"
 Write-Log "Лог находится здесь: $LogFile"
-Write-Log "ВАЖНО: после установки Docker Desktop, Office или VPN-клиентов может потребоваться перезагрузка Windows." "WARN"
+
 
 exit 0
